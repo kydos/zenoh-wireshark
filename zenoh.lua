@@ -99,6 +99,24 @@ local vs_priority      = {
 local vs_resolution    = {
     [0] = "8-bit", [1] = "16-bit", [2] = "32-bit", [3] = "64-bit",
 }
+-- Extension ID names (transport-layer context)
+local vs_transport_ext_id = {
+    [0x01] = "QoS",
+    [0x02] = "Auth",
+    [0x03] = "MultiLink",
+    [0x04] = "LowLatency",
+    [0x05] = "Compression",
+    [0x07] = "Patch",
+    [0x09] = "RegionName",
+}
+-- Extension ID names (network-layer context)
+local vs_network_ext_id = {
+    [0x01] = "QoS",
+    [0x02] = "Timestamp",
+    [0x03] = "NodeId",
+    [0x04] = "RecvTimestamp",
+    [0x05] = "Attachment",
+}
 
 -- ──────────────────────────────────────────────────────────────
 -- 3.  ProtoField definitions
@@ -108,7 +126,7 @@ local pf               = {}
 local F                = zenoh_proto.fields -- must assign all pf.*  values here
 
 -- framing
-pf.batch_len           = ProtoField.uint16("zenoh.batch_len", "Batch Length", base.DEC)
+pf.frame_len           = ProtoField.uint16("zenoh.frame_len", "Frame Length", base.DEC)
 
 -- generic header/flags
 pf.header              = ProtoField.uint8("zenoh.header", "Header Byte", base.HEX)
@@ -322,7 +340,8 @@ local function parse_encoding(tvb, pinfo, tree, offset)
 end
 
 -- Parse extension chain.  Returns new_offset.
-local function parse_extensions(tvb, pinfo, tree, offset)
+-- ext_names (optional): lookup table [id] = "Name" for this message's extensions.
+local function parse_extensions(tvb, pinfo, tree, offset, ext_names)
     while offset < tvb:len() do
         local hdr       = safe_byte(tvb, offset)
         local ext_z     = (hdr >= 0x80)            -- bit 7
@@ -332,8 +351,11 @@ local function parse_extensions(tvb, pinfo, tree, offset)
 
         local ext_start = offset
         local ext_tree  = tree:add(pf.extension, tvb(offset, 1))
-        ext_tree:append_text(string.format(" ID=0x%x %s %s",
-            ext_id, ext_enc == 0 and "Unit" or
+        local name      = ext_names and ext_names[ext_id]
+        local name_str  = name and string.format(" (%s)", name) or ""
+        ext_tree:append_text(string.format(" ID=0x%x%s %s %s",
+            ext_id, name_str,
+            ext_enc == 0 and "Unit" or
             ext_enc == 1 and "Z64" or
             ext_enc == 2 and "ZBuf" or "Rsv",
             ext_m and "(Mandatory)" or ""))
@@ -372,6 +394,14 @@ local function parse_extensions(tvb, pinfo, tree, offset)
     return offset
 end
 
+-- Convenience shims: forward the right name table for the protocol layer.
+local function parse_transport_exts(tvb, pinfo, tree, offset)
+    return parse_extensions(tvb, pinfo, tree, offset, vs_transport_ext_id)
+end
+local function parse_network_exts(tvb, pinfo, tree, offset)
+    return parse_extensions(tvb, pinfo, tree, offset, vs_network_ext_id)
+end
+
 -- ──────────────────────────────────────────────────────────────
 -- 5.  Data sub-message parsers  (PUT / DEL / QUERY / REPLY / ERR)
 -- ──────────────────────────────────────────────────────────────
@@ -383,7 +413,7 @@ local function dissect_put(tvb, pinfo, tree, offset, hdr)
 
     if flag_t then offset = parse_timestamp(tvb, pinfo, tree, offset) end
     if flag_e then offset = parse_encoding(tvb, pinfo, tree, offset) end
-    if flag_z then offset = parse_extensions(tvb, pinfo, tree, offset) end
+    if flag_z then offset = parse_network_exts(tvb, pinfo, tree, offset) end
 
     -- Payload length (z32) – content NOT shown per design
     if offset < tvb:len() then
@@ -405,7 +435,7 @@ local function dissect_del(tvb, pinfo, tree, offset, hdr)
     local flag_z = (hdr >= 128)
 
     if flag_t then offset = parse_timestamp(tvb, pinfo, tree, offset) end
-    if flag_z then offset = parse_extensions(tvb, pinfo, tree, offset) end
+    if flag_z then offset = parse_network_exts(tvb, pinfo, tree, offset) end
     return offset
 end
 
@@ -423,7 +453,7 @@ local function dissect_query(tvb, pinfo, tree, offset, hdr)
         tree:add(pf.query_params, tvb(offset, new_off - offset), ps)
         offset = new_off
     end
-    if flag_z then offset = parse_extensions(tvb, pinfo, tree, offset) end
+    if flag_z then offset = parse_network_exts(tvb, pinfo, tree, offset) end
     return offset
 end
 
@@ -435,7 +465,7 @@ local function dissect_reply(tvb, pinfo, tree, offset, hdr)
         tree:add(pf.consolidation, tvb(offset, 1))
         offset = offset + 1
     end
-    if flag_z then offset = parse_extensions(tvb, pinfo, tree, offset) end
+    if flag_z then offset = parse_network_exts(tvb, pinfo, tree, offset) end
 
     -- ReplyBody = PUT or DEL
     if offset < tvb:len() then
@@ -462,7 +492,7 @@ local function dissect_err(tvb, pinfo, tree, offset, hdr)
     local flag_z = (hdr >= 128)
 
     if flag_e then offset = parse_encoding(tvb, pinfo, tree, offset) end
-    if flag_z then offset = parse_extensions(tvb, pinfo, tree, offset) end
+    if flag_z then offset = parse_network_exts(tvb, pinfo, tree, offset) end
 
     if offset < tvb:len() then
         local plen, pl = read_vle(tvb, offset)
@@ -510,14 +540,14 @@ local function dissect_declaration(tvb, pinfo, tree, offset)
         d_tree:add(pf.expr_id, tvb(offset, eid_len), eid_val)
         offset = offset + eid_len
         offset = parse_wire_expr(tvb, pinfo, d_tree, offset, flag_n, false)
-        if flag_z then offset = parse_extensions(tvb, pinfo, d_tree, offset) end
+        if flag_z then offset = parse_network_exts(tvb, pinfo, d_tree, offset) end
 
         -- ── U_KEYEXPR (0x01) ─────────────────────────────────────
     elseif decl_id == 0x01 then
         local eid_val, eid_len = read_vle(tvb, offset)
         d_tree:add(pf.expr_id, tvb(offset, eid_len), eid_val)
         offset = offset + eid_len
-        if flag_z then offset = parse_extensions(tvb, pinfo, d_tree, offset) end
+        if flag_z then offset = parse_network_exts(tvb, pinfo, d_tree, offset) end
 
         -- ── D_SUBSCRIBER (0x02) ──────────────────────────────────
     elseif decl_id == 0x02 then
@@ -525,12 +555,12 @@ local function dissect_declaration(tvb, pinfo, tree, offset)
         local flag_m = (hdr % 128 >= 64)
         offset = add_vle(d_tree, pf.entity_id, tvb, offset)
         offset = parse_wire_expr(tvb, pinfo, d_tree, offset, flag_n, flag_m)
-        if flag_z then offset = parse_extensions(tvb, pinfo, d_tree, offset) end
+        if flag_z then offset = parse_network_exts(tvb, pinfo, d_tree, offset) end
 
         -- ── U_SUBSCRIBER (0x03) ──────────────────────────────────
     elseif decl_id == 0x03 then
         offset = add_vle(d_tree, pf.entity_id, tvb, offset)
-        if flag_z then offset = parse_extensions(tvb, pinfo, d_tree, offset) end
+        if flag_z then offset = parse_network_exts(tvb, pinfo, d_tree, offset) end
 
         -- ── D_QUERYABLE (0x04) ───────────────────────────────────
     elseif decl_id == 0x04 then
@@ -538,12 +568,12 @@ local function dissect_declaration(tvb, pinfo, tree, offset)
         local flag_m = (hdr % 128 >= 64)
         offset = add_vle(d_tree, pf.entity_id, tvb, offset)
         offset = parse_wire_expr(tvb, pinfo, d_tree, offset, flag_n, flag_m)
-        if flag_z then offset = parse_extensions(tvb, pinfo, d_tree, offset) end
+        if flag_z then offset = parse_network_exts(tvb, pinfo, d_tree, offset) end
 
         -- ── U_QUERYABLE (0x05) ───────────────────────────────────
     elseif decl_id == 0x05 then
         offset = add_vle(d_tree, pf.entity_id, tvb, offset)
-        if flag_z then offset = parse_extensions(tvb, pinfo, d_tree, offset) end
+        if flag_z then offset = parse_network_exts(tvb, pinfo, d_tree, offset) end
 
         -- ── D_TOKEN (0x06) ───────────────────────────────────────
     elseif decl_id == 0x06 then
@@ -551,16 +581,16 @@ local function dissect_declaration(tvb, pinfo, tree, offset)
         local flag_m = (hdr % 128 >= 64)
         offset = add_vle(d_tree, pf.entity_id, tvb, offset)
         offset = parse_wire_expr(tvb, pinfo, d_tree, offset, flag_n, flag_m)
-        if flag_z then offset = parse_extensions(tvb, pinfo, d_tree, offset) end
+        if flag_z then offset = parse_network_exts(tvb, pinfo, d_tree, offset) end
 
         -- ── U_TOKEN (0x07) ───────────────────────────────────────
     elseif decl_id == 0x07 then
         offset = add_vle(d_tree, pf.entity_id, tvb, offset)
-        if flag_z then offset = parse_extensions(tvb, pinfo, d_tree, offset) end
+        if flag_z then offset = parse_network_exts(tvb, pinfo, d_tree, offset) end
 
         -- ── D_FINAL (0x1A) ───────────────────────────────────────
     elseif decl_id == 0x1A then
-        if flag_z then offset = parse_extensions(tvb, pinfo, d_tree, offset) end
+        if flag_z then offset = parse_network_exts(tvb, pinfo, d_tree, offset) end
     end
 
     d_tree:set_len(offset - d_start)
@@ -568,7 +598,8 @@ local function dissect_declaration(tvb, pinfo, tree, offset)
 end
 
 -- Parse an OAM body based on ENC bits (bits 6:5 of the OAM header).
--- ENC=0 (Unit): no body.  ENC=1 (Z64): VLE u64.  ENC=2 (ZBuf): VLE-len + bytes.
+-- ENC=0 (Unit): no body.  ENC=1 (Z64): VLE u64.
+-- ENC=2 (ZBuf): VLE-len + bytes decoded as a sequence of Zenoh z-strings.
 local function parse_oam_body(tvb, tree, offset, hdr)
     local enc = math.floor(hdr / 32) % 4   -- bits 6:5
     if enc == 1 then                        -- Z64: VLE u64 value
@@ -576,11 +607,47 @@ local function parse_oam_body(tvb, tree, offset, hdr)
         tree:add(zenoh_proto, tvb(offset, vlen),
             string.format("OAM Z64 Value: %d", val))
         offset = offset + vlen
-    elseif enc == 2 then                    -- ZBuf: VLE length + raw bytes
+
+    elseif enc == 2 then                    -- ZBuf: sequence of Zenoh strings
         local blen, bvlen = read_vle(tvb, offset)
-        tree:add(zenoh_proto, tvb(offset, bvlen + blen),
-            string.format("OAM Payload [%d bytes]", blen))
-        offset = offset + bvlen + blen
+        local body_start  = offset
+        local body_end    = math.min(offset + bvlen + blen, tvb:len())
+        local body_tree   = tree:add(zenoh_proto, tvb(body_start, body_end - body_start),
+            string.format("OAM Body [%d bytes]", blen))
+        offset = offset + bvlen
+
+        -- Try decoding as: VLE count  +  count × (VLE length + UTF-8 string)
+        local decoded = false
+        if offset < body_end then
+            local count, clen = read_vle(tvb, offset)
+            if count >= 0 and count <= 256 and offset + clen <= body_end then
+                body_tree:add(zenoh_proto, tvb(offset, clen),
+                    string.format("Count: %d", count))
+                offset = offset + clen
+                decoded = true
+                for i = 1, count do
+                    if offset >= body_end then break end
+                    local slen, svlen = read_vle(tvb, offset)
+                    local item_start  = offset
+                    offset = offset + svlen
+                    local avail = math.min(slen, body_end - offset)
+                    if avail > 0 then
+                        local s = tvb(offset, avail):string()
+                        body_tree:add(pf.locator, tvb(item_start, svlen + avail), s)
+                    end
+                    offset = offset + slen
+                end
+            end
+        end
+        if not decoded then
+            -- Fall back: show raw bytes
+            local raw = body_end - offset
+            if raw > 0 then
+                body_tree:add(zenoh_proto, tvb(offset, raw),
+                    string.format("OAM Payload [%d bytes, raw]", raw))
+            end
+            offset = body_end
+        end
     end
     -- enc == 0 (Unit) and enc == 3 (Reserved): no body bytes
     return offset
@@ -615,7 +682,7 @@ local function dissect_network_msg(tvb, pinfo, tree, offset)
         local flag_n = flag_fl1
         local flag_m = flag_fl2
         offset = parse_wire_expr(tvb, pinfo, nm_tree, offset, flag_n, flag_m)
-        if flag_z then offset = parse_extensions(tvb, pinfo, nm_tree, offset) end
+        if flag_z then offset = parse_network_exts(tvb, pinfo, nm_tree, offset) end
 
         -- PushBody = PUT or DEL
         if offset < tvb:len() then
@@ -641,7 +708,7 @@ local function dissect_network_msg(tvb, pinfo, tree, offset)
         if flag_i then
             offset = add_vle(nm_tree, pf.decl_interest_id, tvb, offset)
         end
-        if flag_z then offset = parse_extensions(tvb, pinfo, nm_tree, offset) end
+        if flag_z then offset = parse_network_exts(tvb, pinfo, nm_tree, offset) end
         offset = dissect_declaration(tvb, pinfo, nm_tree, offset)
 
         -- ── REQUEST (0x1C) ───────────────────────────────────────
@@ -650,7 +717,7 @@ local function dissect_network_msg(tvb, pinfo, tree, offset)
         local flag_m = flag_fl2
         offset = add_vle(nm_tree, pf.request_id, tvb, offset)
         offset = parse_wire_expr(tvb, pinfo, nm_tree, offset, flag_n, flag_m)
-        if flag_z then offset = parse_extensions(tvb, pinfo, nm_tree, offset) end
+        if flag_z then offset = parse_network_exts(tvb, pinfo, nm_tree, offset) end
         -- RequestBody = QUERY
         if offset < tvb:len() then
             local body_hdr = safe_byte(tvb, offset)
@@ -671,7 +738,7 @@ local function dissect_network_msg(tvb, pinfo, tree, offset)
         local flag_m = flag_fl2
         offset = add_vle(nm_tree, pf.request_id, tvb, offset)
         offset = parse_wire_expr(tvb, pinfo, nm_tree, offset, flag_n, flag_m)
-        if flag_z then offset = parse_extensions(tvb, pinfo, nm_tree, offset) end
+        if flag_z then offset = parse_network_exts(tvb, pinfo, nm_tree, offset) end
         -- ResponseBody = REPLY or ERR
         if offset < tvb:len() then
             local body_hdr = safe_byte(tvb, offset)
@@ -693,7 +760,7 @@ local function dissect_network_msg(tvb, pinfo, tree, offset)
         -- ── RESPONSE_FINAL (0x1A) ────────────────────────────────
     elseif msg_id == 0x1A then
         offset = add_vle(nm_tree, pf.request_id, tvb, offset)
-        if flag_z then offset = parse_extensions(tvb, pinfo, nm_tree, offset) end
+        if flag_z then offset = parse_network_exts(tvb, pinfo, nm_tree, offset) end
 
         -- ── INTEREST (0x19) ──────────────────────────────────────
     elseif msg_id == 0x19 then
@@ -713,12 +780,12 @@ local function dissect_network_msg(tvb, pinfo, tree, offset)
                 end
             end
         end
-        if flag_z then offset = parse_extensions(tvb, pinfo, nm_tree, offset) end
+        if flag_z then offset = parse_network_exts(tvb, pinfo, nm_tree, offset) end
 
         -- ── OAM (0x1F) ───────────────────────────────────────────
     elseif msg_id == 0x1F then
         offset = add_vle(nm_tree, pf.oam_id, tvb, offset)
-        if flag_z then offset = parse_extensions(tvb, pinfo, nm_tree, offset) end
+        if flag_z then offset = parse_network_exts(tvb, pinfo, nm_tree, offset) end
         offset = parse_oam_body(tvb, nm_tree, offset, hdr)
     end
 
@@ -782,7 +849,7 @@ local function dissect_init(tvb, pinfo, tree, offset, hdr)
         offset = offset + ll + clen
     end
 
-    if flag_z then offset = parse_extensions(tvb, pinfo, tree, offset) end
+    if flag_z then offset = parse_transport_exts(tvb, pinfo, tree, offset) end
     return offset
 end
 
@@ -811,7 +878,7 @@ local function dissect_open(tvb, pinfo, tree, offset, hdr)
         offset = offset + ll + clen
     end
 
-    if flag_z then offset = parse_extensions(tvb, pinfo, tree, offset) end
+    if flag_z then offset = parse_transport_exts(tvb, pinfo, tree, offset) end
     return offset
 end
 
@@ -824,13 +891,13 @@ local function dissect_close(tvb, pinfo, tree, offset, hdr)
         tree:add(pf.close_reason, tvb(offset, 1))
         offset = offset + 1
     end
-    if flag_z then offset = parse_extensions(tvb, pinfo, tree, offset) end
+    if flag_z then offset = parse_transport_exts(tvb, pinfo, tree, offset) end
     return offset
 end
 
 local function dissect_keep_alive(tvb, pinfo, tree, offset, hdr)
     local flag_z = (hdr >= 128)
-    if flag_z then offset = parse_extensions(tvb, pinfo, tree, offset) end
+    if flag_z then offset = parse_transport_exts(tvb, pinfo, tree, offset) end
     return offset
 end
 
@@ -884,7 +951,7 @@ local function dissect_join(tvb, pinfo, tree, offset, hdr)
     offset = add_vle(tree, pf.next_sn_re, tvb, offset)
     offset = add_vle(tree, pf.next_sn_be, tvb, offset)
 
-    if flag_z then offset = parse_extensions(tvb, pinfo, tree, offset) end
+    if flag_z then offset = parse_transport_exts(tvb, pinfo, tree, offset) end
     return offset
 end
 
@@ -932,7 +999,7 @@ local function dissect_transport_msg(tvb, pinfo, batch_tree, offset, batch_end)
         offset = offset + sn_len
 
         -- optional extensions
-        if flag_z then offset = parse_extensions(tvb, pinfo, tm_tree, offset) end
+        if flag_z then offset = parse_transport_exts(tvb, pinfo, tm_tree, offset) end
 
         -- network messages fill the rest of the batch
         local net_tree = tm_tree:add(zenoh_proto, tvb(offset, 0), "Network Messages")
@@ -954,7 +1021,7 @@ local function dissect_transport_msg(tvb, pinfo, batch_tree, offset, batch_end)
         tm_tree:add(pf.seq_num, tvb(offset, sn_len), sn_val)
         offset = offset + sn_len
 
-        if flag_z then offset = parse_extensions(tvb, pinfo, tm_tree, offset) end
+        if flag_z then offset = parse_transport_exts(tvb, pinfo, tm_tree, offset) end
 
         local frag_len = batch_end - offset
         if frag_len > 0 and offset < tvb:len() then
@@ -966,22 +1033,22 @@ local function dissect_transport_msg(tvb, pinfo, batch_tree, offset, batch_end)
         offset = dissect_join(tvb, pinfo, tm_tree, offset, hdr)
     elseif msg_id == 0x00 then -- OAM (transport)
         offset = add_vle(tm_tree, pf.oam_id, tvb, offset)
-        if flag_z then offset = parse_extensions(tvb, pinfo, tm_tree, offset) end
+        if flag_z then offset = parse_transport_exts(tvb, pinfo, tm_tree, offset) end
         offset = parse_oam_body(tvb, tm_tree, offset, hdr)
     else
         -- Unknown transport message ID: consume extensions so the byte stream
         -- stays aligned for the next message.
-        if flag_z then offset = parse_extensions(tvb, pinfo, tm_tree, offset) end
+        if flag_z then offset = parse_transport_exts(tvb, pinfo, tm_tree, offset) end
     end
 
     tm_tree:set_len(offset - tm_start)
     return offset
 end
 
--- Dissect a batch (contents only, without the 2-byte length prefix).
-local function dissect_batch(tvb, pinfo, root_tree, batch_start, batch_end)
+-- Dissect a Zenoh frame (batch contents, without the 2-byte length prefix).
+local function dissect_zenoh_frame(tvb, pinfo, root_tree, batch_start, batch_end)
     local btree = root_tree:add(zenoh_proto, tvb(batch_start, batch_end - batch_start),
-        string.format("Zenoh Batch [%d bytes]", batch_end - batch_start))
+        string.format("Zenoh Frame [%d bytes]", batch_end - batch_start))
 
     local offset = batch_start
     while offset < batch_end and offset < tvb:len() do
@@ -1027,7 +1094,7 @@ local function dissect_scout(tvb, pinfo, tree, offset, hdr)
         offset = offset + zid_bytes
     end
 
-    if flag_z then offset = parse_extensions(tvb, pinfo, tree, offset) end
+    if flag_z then offset = parse_transport_exts(tvb, pinfo, tree, offset) end
     return offset
 end
 
@@ -1074,7 +1141,7 @@ local function dissect_hello(tvb, pinfo, tree, offset, hdr)
         end
     end
 
-    if flag_z then offset = parse_extensions(tvb, pinfo, tree, offset) end
+    if flag_z then offset = parse_transport_exts(tvb, pinfo, tree, offset) end
     return offset
 end
 
@@ -1082,7 +1149,7 @@ end
 -- 11.  Main dissector entry points
 -- ──────────────────────────────────────────────────────────────
 
--- TCP dissector with batch-length desegmentation
+-- TCP dissector with frame-length desegmentation
 function zenoh_proto.dissector(tvb, pinfo, tree)
     pinfo.cols.protocol:set("Zenoh")
 
@@ -1093,7 +1160,11 @@ function zenoh_proto.dissector(tvb, pinfo, tree)
     local is_tcp      = (pinfo.port_type == 2) -- Port.TCP = 2
     local is_scouting = (pinfo.dst_port == 7446 or pinfo.src_port == 7446)
 
-    local root        = tree:add(zenoh_proto, tvb(), "Zenoh Protocol")
+    -- Build the Zenoh subtree.  Note: Wireshark's Lua dispatch adds a sibling
+    -- "Wireshark Lua fake item" node before calling this function; that item is
+    -- hidden automatically in Wireshark >= 4.2 but visible in older builds.
+    -- There is no Lua API to suppress it — it is a framework artifact.
+    local root = tree:add(zenoh_proto, tvb(), "Zenoh Protocol")
 
     -- ── Scouting (UDP 7446) ──────────────────────────────────
     if is_scouting and not is_tcp then
@@ -1131,7 +1202,7 @@ function zenoh_proto.dissector(tvb, pinfo, tree)
         return total
     end
 
-    -- ── TCP  (with 2-byte LE batch-length prefix) ────────────
+    -- ── TCP  (with 2-byte LE frame-length prefix) ────────────
     if is_tcp then
         local offset = 0
         while offset < total do
@@ -1142,27 +1213,27 @@ function zenoh_proto.dissector(tvb, pinfo, tree)
                 return
             end
 
-            local batch_len = tvb(offset, 2):le_uint()
+            local frame_len = tvb(offset, 2):le_uint()
 
-            if total - offset < 2 + batch_len then
-                -- Incomplete batch; request reassembly
+            if total - offset < 2 + frame_len then
+                -- Incomplete frame; request reassembly
                 pinfo.desegment_offset = offset
-                pinfo.desegment_len    = (2 + batch_len) - (total - offset)
+                pinfo.desegment_len    = (2 + frame_len) - (total - offset)
                 return
             end
 
-            root:add_le(pf.batch_len, tvb(offset, 2))
+            root:add_le(pf.frame_len, tvb(offset, 2))
             local batch_start = offset + 2
-            local batch_end   = batch_start + batch_len
+            local batch_end   = batch_start + frame_len
 
-            dissect_batch(tvb, pinfo, root, batch_start, batch_end)
+            dissect_zenoh_frame(tvb, pinfo, root, batch_start, batch_end)
             offset = batch_end
         end
         return total
     end
 
     -- ── UDP (datagram = one batch, no length prefix) ─────────
-    dissect_batch(tvb, pinfo, root, 0, total)
+    dissect_zenoh_frame(tvb, pinfo, root, 0, total)
     return total
 end
 
