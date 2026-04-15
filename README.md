@@ -1,6 +1,7 @@
 # zenoh-wireshark
 
-A Wireshark Lua dissector for the [Zenoh](https://zenoh.io) protocol.
+A Wireshark Lua dissector for the [Zenoh](https://zenoh.io) protocol whose draft 
+specification is available [here](https://spec.zenoh.io).
 
 Supports TCP and UDP transport on the standard Zenoh ports (7447, 7448) and
 UDP scouting on port 7446. Highlights all protocol boundaries — transport
