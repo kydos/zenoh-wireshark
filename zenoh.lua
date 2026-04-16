@@ -29,7 +29,7 @@
 
 -- Use a unique abbr so this Lua dissector coexists with any installed native plugin.
 -- The display name is still "Zenoh Protocol" for readability in the UI.
-local zenoh_proto      = Proto("Zenoh", "Zenoh Protocol")
+local zenoh_proto      = Proto("zenoh", "Zenoh Protocol (Lua)")
 
 -- ──────────────────────────────────────────────────────────────
 -- 2.  Value-string tables (for display)
@@ -624,68 +624,112 @@ local function parse_link_state_list(tvb, tree, offset, body_end)
 
         local opts, olen = read_vle(tvb, offset)
         if offset + olen > body_end then ls_tree:set_len(1); break end
-        ls_tree:add(zenoh_proto, tvb(offset, olen),
-            string.format("Options: 0x%02x (PID=%d WAI=%d LOC=%d WGT=%d GWY=%d)",
-                opts,
-                opts % 2,
-                math.floor(opts / 2) % 2,
-                math.floor(opts / 4) % 2,
-                math.floor(opts / 8) % 2,
-                math.floor(opts / 16) % 2))
         offset = offset + olen
 
-        local psid, plen = read_vle(tvb, offset)
-        if offset + plen > body_end then ls_tree:set_len(offset - ls_start); break end
-        ls_tree:add(zenoh_proto, tvb(offset, plen), string.format("PSID: %d", psid))
-        offset = offset + plen
-
-        local sn, snlen = read_vle(tvb, offset)
-        if offset + snlen > body_end then ls_tree:set_len(offset - ls_start); break end
-        ls_tree:add(zenoh_proto, tvb(offset, snlen), string.format("SN: %d", sn))
-        offset = offset + snlen
-
-        -- ZenohID: u8 length + bytes  (PID flag = bit 0)
+        -- Peek ahead to detect v3 locator-only LinkState format.
+        -- In v3, a locator-only entry has no opts/psid/sn/ZenohId header; instead
+        -- it encodes directly as: u8 locator_count | (u8 str_len + bytes)* | VLE links.
+        -- When the v9 parser reads such an entry it interprets the locator_count as
+        -- opts (with PID=1 set) and the first locator's length as psid, so the
+        -- would-be ZenohId length (the first byte of the locator string) exceeds 16.
+        -- Detect this and fall back to v3 locator-only parsing.
+        local v3_locators = false
         if (opts % 2 == 1) and offset < body_end then
-            local zid_len   = safe_byte(tvb, offset)
-            local zid_start = offset
-            offset = offset + 1
-            if offset + zid_len <= body_end then
-                ls_tree:add(pf.zid, tvb(zid_start, 1 + zid_len))
-                offset = offset + zid_len
-            end
-        end
-
-        -- WhatAmI: u8  (WAI flag = bit 1)
-        if (math.floor(opts / 2) % 2 == 1) and offset < body_end then
-            local wai = safe_byte(tvb, offset)
-            ls_tree:add(zenoh_proto, tvb(offset, 1),
-                string.format("WhatAmI: %s", lookup(vs_wai, wai)))
-            offset = offset + 1
-        end
-
-        -- Locators: VLE count + (u8 str_len + bytes)*  (LOC flag = bit 2)
-        if (math.floor(opts / 4) % 2 == 1) and offset < body_end then
-            local lcount, lclen = read_vle(tvb, offset)
-            if offset + lclen <= body_end then
-                ls_tree:add(zenoh_proto, tvb(offset, lclen),
-                    string.format("Locator count: %d", lcount))
-                offset = offset + lclen
-                for j = 1, lcount do
-                    if offset >= body_end then break end
-                    local slen      = safe_byte(tvb, offset)
-                    local loc_start = offset
-                    offset = offset + 1
-                    local avail = math.min(slen, body_end - offset)
-                    if avail > 0 then
-                        ls_tree:add(pf.locator, tvb(loc_start, 1 + avail),
-                            tvb(offset, avail):string())
-                    end
-                    offset = offset + slen
+            -- Skip over psid and sn VLEs to reach the would-be zid_len byte.
+            local peek = offset
+            local _, plen2 = read_vle(tvb, peek); peek = peek + plen2
+            local _, snlen2 = read_vle(tvb, peek); peek = peek + snlen2
+            if peek < body_end then
+                local would_be_zid_len = safe_byte(tvb, peek)
+                if would_be_zid_len > 16 then
+                    -- v3 locator-only: opts holds the locator count, offset
+                    -- already points at the first locator's length byte.
+                    v3_locators = true
                 end
             end
         end
 
-        -- Links: VLE count + VLE link_id*
+        if v3_locators then
+            -- v3 locator-only LinkState: opts = locator count, no other header fields.
+            local lcount = opts
+            ls_tree:add(zenoh_proto, tvb(ls_start, olen),
+                string.format("Locator count (v3): %d", lcount))
+            for j = 1, lcount do
+                if offset >= body_end then break end
+                local slen      = safe_byte(tvb, offset)
+                local loc_start = offset
+                offset = offset + 1
+                local avail = math.min(slen, body_end - offset)
+                if avail > 0 then
+                    ls_tree:add(pf.locator, tvb(loc_start, 1 + avail),
+                        tvb(offset, avail):string())
+                end
+                offset = offset + slen
+            end
+        else
+            -- Normal v9 LinkState: opts | psid | sn | [ZenohId] | [WhatAmI] | [Locators]
+            ls_tree:add(zenoh_proto, tvb(ls_start, olen),
+                string.format("Options: 0x%02x (PID=%d WAI=%d LOC=%d WGT=%d GWY=%d)",
+                    opts,
+                    opts % 2,
+                    math.floor(opts / 2) % 2,
+                    math.floor(opts / 4) % 2,
+                    math.floor(opts / 8) % 2,
+                    math.floor(opts / 16) % 2))
+
+            local psid, plen = read_vle(tvb, offset)
+            if offset + plen > body_end then ls_tree:set_len(offset - ls_start); break end
+            ls_tree:add(zenoh_proto, tvb(offset, plen), string.format("PSID: %d", psid))
+            offset = offset + plen
+
+            local sn, snlen = read_vle(tvb, offset)
+            if offset + snlen > body_end then ls_tree:set_len(offset - ls_start); break end
+            ls_tree:add(zenoh_proto, tvb(offset, snlen), string.format("SN: %d", sn))
+            offset = offset + snlen
+
+            -- ZenohID: u8 length + bytes  (PID flag = bit 0)
+            if (opts % 2 == 1) and offset < body_end then
+                local zid_len   = safe_byte(tvb, offset)
+                local zid_start = offset
+                offset = offset + 1
+                if offset + zid_len <= body_end then
+                    ls_tree:add(pf.zid, tvb(zid_start, 1 + zid_len))
+                    offset = offset + zid_len
+                end
+            end
+
+            -- WhatAmI: u8  (WAI flag = bit 1)
+            if (math.floor(opts / 2) % 2 == 1) and offset < body_end then
+                local wai = safe_byte(tvb, offset)
+                ls_tree:add(zenoh_proto, tvb(offset, 1),
+                    string.format("WhatAmI: %s", lookup(vs_wai, wai)))
+                offset = offset + 1
+            end
+
+            -- Locators: VLE count + (u8 str_len + bytes)*  (LOC flag = bit 2)
+            if (math.floor(opts / 4) % 2 == 1) and offset < body_end then
+                local lcount, lclen = read_vle(tvb, offset)
+                if offset + lclen <= body_end then
+                    ls_tree:add(zenoh_proto, tvb(offset, lclen),
+                        string.format("Locator count: %d", lcount))
+                    offset = offset + lclen
+                    for j = 1, lcount do
+                        if offset >= body_end then break end
+                        local slen      = safe_byte(tvb, offset)
+                        local loc_start = offset
+                        offset = offset + 1
+                        local avail = math.min(slen, body_end - offset)
+                        if avail > 0 then
+                            ls_tree:add(pf.locator, tvb(loc_start, 1 + avail),
+                                tvb(offset, avail):string())
+                        end
+                        offset = offset + slen
+                    end
+                end
+            end
+        end
+
+        -- Links: VLE count + VLE link_id*  (present in both v3 and v9)
         local llinks, lllen = read_vle(tvb, offset)
         if offset + lllen <= body_end then
             ls_tree:add(zenoh_proto, tvb(offset, lllen),
@@ -699,8 +743,8 @@ local function parse_link_state_list(tvb, tree, offset, body_end)
                 offset = offset + lilen
             end
 
-            -- Weights: u16le per link  (WGT flag = bit 3)
-            if (math.floor(opts / 8) % 2 == 1) then
+            -- Weights: u16le per link  (WGT flag = bit 3, v9 only)
+            if not v3_locators and (math.floor(opts / 8) % 2 == 1) then
                 for k = 1, llinks do
                     if offset + 2 > body_end then break end
                     ls_tree:add(zenoh_proto, tvb(offset, 2),
