@@ -74,6 +74,9 @@ local vs_decl_id       = {
 }
 local vs_scout_id      = { [0x01] = "SCOUT", [0x02] = "HELLO" }
 local vs_wai           = { [0] = "Router", [1] = "Peer", [2] = "Client" }
+-- WhatAmI as direct Rust enum repr (Router=0b001, Peer=0b010, Client=0b100).
+-- Used wherever the raw bitmask value is written to the wire (e.g. LinkState OAM body).
+local vs_wai_bitmask   = { [1] = "Router", [2] = "Peer", [4] = "Client" }
 local vs_enc_type      = { [0] = "Unit", [1] = "Z64", [2] = "ZBuf", [3] = "Reserved" }
 local vs_close_reason  = {
     [0] = "Generic",
@@ -699,10 +702,11 @@ local function parse_link_state_list(tvb, tree, offset, body_end)
             end
 
             -- WhatAmI: u8  (WAI flag = bit 1)
+            -- Wire value is the Rust enum repr: Router=1, Peer=2, Client=4.
             if (math.floor(opts / 2) % 2 == 1) and offset < body_end then
                 local wai = safe_byte(tvb, offset)
                 ls_tree:add(zenoh_proto, tvb(offset, 1),
-                    string.format("WhatAmI: %s", lookup(vs_wai, wai)))
+                    string.format("WhatAmI: %s", lookup(vs_wai_bitmask, wai)))
                 offset = offset + 1
             end
 
@@ -903,19 +907,19 @@ local function dissect_network_msg(tvb, pinfo, tree, offset)
 
         -- ── INTEREST (0x19) ──────────────────────────────────────
     elseif msg_id == 0x19 then
-        local mod = math.floor(hdr / 32) % 4 -- bits 6:5 of raw header
+        local mod = math.floor(hdr / 32) % 4 -- bits 6:5: 0=Final 1=Current 2=Future 3=CurrentFuture
         offset = add_vle(nm_tree, pf.interest_id, tvb, offset)
-        nm_tree:add(pf.interest_mod, tvb(offset - 1, 1), mod)
-        if mod ~= 0 then -- not Final → has options + WireExpr
+        nm_tree:add(pf.interest_mod, tvb(nm_start, 1), mod) -- mode lives in the header byte
+        if mod ~= 0 then -- not Final → options byte + optional WireExpr
             if offset < tvb:len() then
                 nm_tree:add(pf.interest_options, tvb(offset, 1))
-                local opts    = safe_byte(tvb, offset)
-                offset        = offset + 1
-                local has_key = ((opts % 4) >= 2) -- bit R (bit 1)
-                local has_n   = (opts >= 128)     -- bit A (bit 7)... simplified
-                if has_key then
-                    offset = parse_wire_expr(tvb, pinfo, nm_tree, offset,
-                        (opts % 8 >= 4), false) -- N flag = bit 2
+                local opts   = safe_byte(tvb, offset)
+                offset       = offset + 1
+                local flag_r = (math.floor(opts / 16) % 2 == 1) -- bit 4: R (Restricted, WireExpr present)
+                local flag_n = (math.floor(opts / 32) % 2 == 1) -- bit 5: N (Named, key suffix present)
+                local flag_m = (math.floor(opts / 64) % 2 == 1) -- bit 6: M (Mapping)
+                if flag_r then
+                    offset = parse_wire_expr(tvb, pinfo, nm_tree, offset, flag_n, flag_m)
                 end
             end
         end
