@@ -270,8 +270,11 @@ end
 -- ZID table: stream_zid_table[stream_key] = { src = ByteArray, dst = ByteArray }
 -- Populated by INIT/JOIN/SCOUT/HELLO parsers on the first dissection pass.
 local stream_zid_table     = {}
--- Key expression table: keyexpr_table[stream_key][expr_id] = "full/key/expression"
--- Populated when a D_KEYEXPR declaration is parsed.
+-- Key expression table: keyexpr_table[stream_key][direction][expr_id] = "full/key/expression"
+-- Populated when a D_KEYEXPR declaration is parsed. ExprIds are scoped per face
+-- AND per direction in Zenoh, so we must keep separate tables for each side of
+-- the link. The 'direction' key identifies the declarer (src side of the packet
+-- carrying the D_KEYEXPR).
 local keyexpr_table        = {}
 -- Per-packet ZID snapshot — stable across Wireshark's multiple re-dissection passes.
 local packet_zid_cache     = {}
@@ -300,6 +303,18 @@ local function get_stream_key(pinfo)
     local s2 = tostring(pinfo.dst)  .. ":" .. tostring(pinfo.dst_port)
     if s1 > s2 then s1, s2 = s2, s1 end
     return "udp:" .. s1 .. "-" .. s2
+end
+
+-- Return a key identifying the SENDER side (src) of the current packet on its
+-- stream. Used to scope per-direction state such as the D_KEYEXPR table.
+local function get_sender_dir_key(pinfo)
+    return tostring(pinfo.src) .. ":" .. tostring(pinfo.src_port)
+end
+
+-- Return a key identifying the RECEIVER side (dst) of the current packet on its
+-- stream.
+local function get_receiver_dir_key(pinfo)
+    return tostring(pinfo.dst) .. ":" .. tostring(pinfo.dst_port)
 end
 
 -- Record the ZID bytes seen in INIT / JOIN / SCOUT / HELLO into the stream table.
@@ -419,7 +434,12 @@ local function parse_wire_expr(tvb, pinfo, tree, offset, n_flag, m_flag, limit)
         resolved = suffix
     elseif scope_val ~= 0 then
         local sk    = get_stream_key(pinfo)
-        local tbl   = keyexpr_table[sk]
+        -- mapping=sender (m_flag=true)  → look up in the sender's own declarations
+        -- mapping=receiver (m_flag=false) → look up in the receiver's declarations
+        --   (which were sent on the opposite direction of this stream)
+        local dir   = m_flag and get_sender_dir_key(pinfo) or get_receiver_dir_key(pinfo)
+        local stbl  = keyexpr_table[sk]
+        local tbl   = stbl and stbl[dir]
         local base  = tbl and tbl[scope_val]
         if base then
             -- The wire suffix already contains the leading separator when present;
@@ -1106,20 +1126,26 @@ local function dissect_declaration(tvb, pinfo, tree, offset)
             local scope_v, sl   = read_vle(tvb, offset)
             local decl_suffix, _ = read_z16_string(tvb, offset + sl)
             if #decl_suffix > 0 then
-                local sk = get_stream_key(pinfo)
+                local sk  = get_stream_key(pinfo)
+                -- D_KEYEXPR carries declarations from the SENDER. Index the
+                -- table by the sender's direction so the opposite peer's
+                -- identically numbered ExprIds do not collide with these.
+                local dir = get_sender_dir_key(pinfo)
                 if not keyexpr_table[sk] then keyexpr_table[sk] = {} end
+                if not keyexpr_table[sk][dir] then keyexpr_table[sk][dir] = {} end
+                local dtbl = keyexpr_table[sk][dir]
                 -- If scope_v == 0, decl_suffix is the full absolute key expression.
-                -- If scope_v != 0, store the suffix fragment; parse_wire_expr will
-                -- compose it with the base when the scope is resolved.
+                -- If scope_v != 0, store the composed key by resolving the base
+                -- against the SAME direction's table (the declarer references
+                -- only its own previously declared ExprIds).
                 if scope_v == 0 then
-                    keyexpr_table[sk][eid_val] = decl_suffix
+                    dtbl[eid_val] = decl_suffix
                 else
-                    local tbl  = keyexpr_table[sk]
-                    local base = tbl and tbl[scope_v]
+                    local base = dtbl[scope_v]
                     if base then
-                        keyexpr_table[sk][eid_val] = base .. decl_suffix
+                        dtbl[eid_val] = base .. decl_suffix
                     else
-                        keyexpr_table[sk][eid_val] = decl_suffix
+                        dtbl[eid_val] = decl_suffix
                     end
                 end
             end
