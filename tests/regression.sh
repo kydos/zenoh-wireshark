@@ -97,4 +97,17 @@ run_capture \
     "Scouting: SCOUT" \
     "WhatAmI Matcher: 0x03"
 
+# LZ4 batch compression (INIT with compression extension, BatchHeader, decompressed frames)
+run_capture \
+    "assets/pub-sub-compression.pcapng" \
+    "Transport: INIT (InitSyn)" \
+    "ID=0x6 (Compression) Unit" \
+    "Batch Header: 0x01" \
+    "LZ4 Compressed: Yes" \
+    "Zenoh Frame [436 bytes, decompressed from 299]" \
+    "Batch Header: 0x00" \
+    "LZ4 Compressed: No" \
+    "Declaration: D_KEYEXPR" \
+    "Key Expression (resolved): demo/example"
+
 echo "All regression checks passed."

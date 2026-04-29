@@ -142,7 +142,9 @@ local pf               = {}
 local F                = zenoh_proto.fields -- must assign all pf.*  values here
 
 -- framing
-pf.frame_len           = ProtoField.uint16("zenoh.frame_len", "Frame Length", base.DEC)
+pf.frame_len           = ProtoField.uint16("zenoh.frame_len",       "Frame Length",    base.DEC)
+pf.batch_header        = ProtoField.uint8( "zenoh.batch.header",    "Batch Header",    base.HEX)
+pf.batch_compressed    = ProtoField.bool(  "zenoh.batch.compressed","LZ4 Compressed",  8, {"Yes","No"}, 0x01)
 
 -- generic header/flags
 pf.header              = ProtoField.uint8("zenoh.header", "Header Byte", base.HEX)
@@ -341,6 +343,15 @@ local decl_state         = {}
 local pkt_decl_cache     = {}
 -- Session protocol version: session_ver[sk] = version_byte
 local session_ver        = {}
+
+-- Compression state per TCP stream.
+-- stream_compress_init[sk] = true  when InitAck on this stream carries extension ID 0x6,
+--   meaning both peers agreed to use batch-level LZ4 compression.
+local stream_compress_init = {}
+-- stream_compress_from[sk] = pinfo.number of the OpenAck that closed the handshake.
+-- Every batch in frames with pinfo.number > this value starts with a 1-byte BatchHeader
+--   (bit 0: 1 = LZ4-compressed, 0 = sent uncompressed despite compression being enabled).
+local stream_compress_from = {}
 
 -- Field extractor for tcp.stream.  Field.new MUST be called at the script top level
 -- (i.e. during plugin load), not inside any function — Wireshark registers extractors
@@ -867,8 +878,9 @@ local function decode_wireexpr_zbuf_ext(ext_tree, tvb, pinfo, offset, actual)
 end
 
 -- Parse extension chain. Returns new_offset.
--- spec (optional): table [id] = { name = string|fn(enc), unit=fn, z64=fn, zbuf=fn }
-local function parse_extensions(tvb, pinfo, tree, offset, spec)
+-- spec     (optional): table [id] = { name = string|fn(enc), unit=fn, z64=fn, zbuf=fn }
+-- seen_ids (optional): output table; seen_ids[ext_id] = true for every ID encountered
+local function parse_extensions(tvb, pinfo, tree, offset, spec, seen_ids)
     while offset < tvb:len() do
         local hdr       = safe_byte(tvb, offset)
         local ext_z     = (hdr >= 0x80)            -- bit 7
@@ -876,6 +888,7 @@ local function parse_extensions(tvb, pinfo, tree, offset, spec)
         local ext_m     = (hdr % 32 >= 16)         -- bit 4
         local ext_id    = hdr % 16                 -- bits 3:0
         local ext_spec  = spec and spec[ext_id]
+        if seen_ids then seen_ids[ext_id] = true end
 
         local ext_start = offset
         local ext_tree  = tree:add(pf.extension, tvb(offset, 1))
@@ -929,6 +942,73 @@ local function parse_extensions(tvb, pinfo, tree, offset, spec)
         if not ext_z then break end -- no more extensions
     end
     return offset
+end
+
+-- Pure-Lua LZ4 block-format decompressor.
+-- Input : src_ba  – Wireshark ByteArray (compressed payload)
+-- Output: a new ByteArray with decompressed bytes, or raises an error string on failure.
+-- Implements the LZ4 block format as used by lz4_flex::block::{compress,decompress}_into.
+local function lz4_block_decompress(src_ba)
+    local src_len = src_ba:len()
+    local out     = {}   -- decompressed bytes (1-indexed Lua table)
+    local si      = 0    -- 0-indexed read cursor into src_ba
+
+    local function read_byte()
+        if si >= src_len then error("LZ4: unexpected end of input") end
+        local b = src_ba:get_index(si)
+        si = si + 1
+        return b
+    end
+
+    while si < src_len do
+        local token   = read_byte()
+        local lit_len = math.floor(token / 16)   -- high nibble
+
+        -- Extended literal length: keep adding while extra == 255
+        if lit_len == 15 then
+            while true do
+                local extra = read_byte()
+                lit_len = lit_len + extra
+                if extra ~= 255 then break end
+            end
+        end
+
+        -- Copy literal bytes directly to output
+        for _ = 1, lit_len do out[#out + 1] = read_byte() end
+
+        -- The last sequence of an LZ4 block has no match copy
+        if si >= src_len then break end
+
+        -- Match offset: little-endian u16
+        local off_lo = read_byte()
+        local off_hi = read_byte()
+        local moff   = off_lo + off_hi * 256
+        if moff == 0 then error("LZ4: zero match offset") end
+
+        -- Match length: low nibble + 4; extended if nibble == 15
+        local mlen_nibble = token % 16
+        local mlen        = mlen_nibble + 4
+        if mlen_nibble == 15 then
+            while true do
+                local extra = read_byte()
+                mlen = mlen + extra
+                if extra ~= 255 then break end
+            end
+        end
+
+        -- Copy match bytes (sequential single-byte copy handles overlapping runs)
+        local mpos = #out - moff
+        for _ = 1, mlen do
+            mpos = mpos + 1
+            out[#out + 1] = out[mpos]
+        end
+    end
+
+    -- Pack result into a Wireshark ByteArray so it can become a Tvb
+    local ba = ByteArray.new()
+    ba:set_size(#out)
+    for i, v in ipairs(out) do ba:set_index(i - 1, v) end
+    return ba
 end
 
 -- Convert a pinfo NSTime absolute timestamp to seconds (float).
@@ -1074,8 +1154,8 @@ local extspec_decl_undeclare = {
     [0x0F] = { name = "WireExpr", zbuf = decode_wireexpr_zbuf_ext },
 }
 
-local function parse_init_exts(tvb, pinfo, tree, offset)
-    return parse_extensions(tvb, pinfo, tree, offset, extspec_init)
+local function parse_init_exts(tvb, pinfo, tree, offset, seen_ids)
+    return parse_extensions(tvb, pinfo, tree, offset, extspec_init, seen_ids)
 end
 
 local function parse_open_exts(tvb, pinfo, tree, offset)
@@ -1973,7 +2053,15 @@ local function dissect_init(tvb, pinfo, tree, offset, hdr)
         offset = offset + ll + clen
     end
 
-    if flag_z then offset = parse_init_exts(tvb, pinfo, tree, offset) end
+    if flag_z then
+        local seen = {}
+        offset = parse_init_exts(tvb, pinfo, tree, offset, seen)
+        -- Record that compression was agreed when both sides echoed extension 0x6.
+        -- The acceptor only echoes it in InitAck (flag_a = true) when both sides agree.
+        if flag_a and seen[0x6] and not pinfo.visited then
+            stream_compress_init[get_stream_key(pinfo)] = true
+        end
+    end
     return offset
 end
 
@@ -2004,6 +2092,14 @@ local function dissect_open(tvb, pinfo, tree, offset, hdr)
     end
 
     if flag_z then offset = parse_open_exts(tvb, pinfo, tree, offset) end
+    -- OpenAck completes the Zenoh handshake. From the very next batch onwards,
+    -- every batch on this stream will be prefixed by a 1-byte BatchHeader.
+    if flag_a and not pinfo.visited then
+        local sk = get_stream_key(pinfo)
+        if stream_compress_init[sk] and not stream_compress_from[sk] then
+            stream_compress_from[sk] = pinfo.number
+        end
+    end
     return offset
 end
 
@@ -2477,7 +2573,10 @@ function zenoh_proto.dissector(tvb, pinfo, tree)
 
     -- ── TCP  (with 2-byte LE frame-length prefix) ────────────
     if is_tcp then
-        local offset = 0
+        local offset        = 0
+        local sk            = get_stream_key(pinfo)
+        local compress_from = stream_compress_from[sk]  -- nil or OpenAck frame number
+
         while offset < total do
             if total - offset < 2 then
                 -- Not enough bytes for the length prefix; request more
@@ -2499,7 +2598,63 @@ function zenoh_proto.dissector(tvb, pinfo, tree)
             local batch_start = offset + 2
             local batch_end   = batch_start + frame_len
 
-            dissect_zenoh_frame(tvb, pinfo, root, batch_start, batch_end)
+            -- Post-handshake batches on compressed streams start with a 1-byte BatchHeader.
+            -- The header is present in every frame whose number is STRICTLY after the
+            -- OpenAck (INIT/OPEN themselves are never compressed).
+            if compress_from and pinfo.number > compress_from and frame_len >= 1 then
+                local bh_byte  = tvb(batch_start, 1):uint()
+                local is_compr = (bh_byte % 2 == 1)   -- bit 0
+
+                root:add(pf.batch_header,     tvb(batch_start, 1))
+                root:add(pf.batch_compressed, tvb(batch_start, 1))
+                batch_start = batch_start + 1  -- consume the BatchHeader byte
+
+                if is_compr then
+                    -- LZ4-block-compressed batch: decompress, then dissect the result.
+                    local comp_len = batch_end - batch_start
+                    if comp_len > 0 then
+                        local ok, result = pcall(lz4_block_decompress,
+                                                 tvb(batch_start, comp_len):bytes())
+                        if ok and result then
+                            local decomp_tvb = result:tvb("Zenoh [decompressed]")
+                            local decomp_len = decomp_tvb:len()
+                            local btree = root:add(zenoh_proto, tvb(batch_start, comp_len),
+                                string.format("Zenoh Frame [%d bytes, decompressed from %d]",
+                                    decomp_len, comp_len))
+                            local di = btree:add(zenoh_proto, tvb(batch_start, 0),
+                                string.format("Decompressed: %d bytes", decomp_len))
+                            di:set_generated(true)
+                            -- Parse all transport messages from the decompressed Tvb.
+                            local doff = 0
+                            while doff < decomp_len do
+                                local prev = doff
+                                local ok2, err2 = pcall(function()
+                                    doff = dissect_transport_msg(
+                                        decomp_tvb, pinfo, btree, doff, decomp_len)
+                                end)
+                                if not ok2 then
+                                    btree:add_expert_info(PI_MALFORMED, PI_ERROR,
+                                        string.format("Decompress/dissect error at %d: %s",
+                                            doff, tostring(err2)))
+                                    break
+                                end
+                                if doff == prev then break end
+                            end
+                        else
+                            root:add_expert_info(PI_MALFORMED, PI_ERROR,
+                                "LZ4 decompression failed: " .. tostring(result))
+                        end
+                    end
+                else
+                    -- Compression enabled but this batch was sent uncompressed
+                    -- (LZ4 did not reduce its size — normal for small or random data).
+                    dissect_zenoh_frame(tvb, pinfo, root, batch_start, batch_end)
+                end
+            else
+                -- Pre-handshake or non-compressed stream: no BatchHeader.
+                dissect_zenoh_frame(tvb, pinfo, root, batch_start, batch_end)
+            end
+
             offset = batch_end
         end
         if tostring(pinfo.cols.info) == "" then
